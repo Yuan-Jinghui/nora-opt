@@ -1,64 +1,39 @@
-# mypy: allow-untyped-defs
-# mypy: disable-error-code=arg-type
-"""Implementation of the Nora optimizer with automatic AdamW fallback for 1D params."""
-
 import math
 import torch
-from torch import Tensor
-from torch.optim.optimizer import Optimizer
+import torch.nn.functional as F
 
-__all__ = ["Nora"]
-
-class Nora(Optimizer):
-    r"""Implements the Nora (Normalized Orthogonal Row Alignment) algorithm.
-    
-    Automatically applies Nora to 2D parameters (e.g., linear layers) and falls back 
-    to AdamW for 1D or >2D parameters (e.g., biases, normalization layers, embeddings).
-
-    Nora updates 2D parameters by explicitly projecting the momentum onto the tangent 
-    space of the weights and performing a row-wise normalization.
-    
-    Args:
-        params (iterable): iterable of parameters to optimize or dicts defining parameter groups
-        lr (float, optional): learning rate (default: 1e-3)
-        betas (Tuple[float, float], optional): coefficients used for computing
-            running averages of gradient and its square. beta1 acts as the momentum 
-            coefficient \beta for Nora. (default: (0.9, 0.999))
-        eps (float, optional): term added to the denominator to improve
-            numerical stability (default: 1e-8)
-        weight_decay (float, optional): decoupled weight decay (L2 penalty) (default: 0.0)
+class NORA(torch.optim.Optimizer):
     """
+    Normalized Orthogonal Row Alignment (NORA) 优化器。
     
+    该优化器针对大规模矩阵训练设计：
+    - 对 2D 矩阵参数（如线性层权重）应用 Nora 算法：进行动量的行空间切线投影及行归一化。
+    - 对 1D 或非矩阵参数（如 Bias, LayerNorm, Embeddings）回退使用标准的 AdamW 算法。
+    """
+
     def __init__(
         self,
-        params,
-        lr: float = 1e-3,
-        betas: tuple[float, float] = (0.9, 0.999),
-        eps: float = 1e-8,
-        weight_decay: float = 0.0,
-    ) -> None:
-        if not 0.0 <= lr:
-            raise ValueError(f"Invalid learning rate: {lr}")
-        if not 0.0 <= eps:
-            raise ValueError(f"Invalid epsilon value: {eps}")
-        if not 0.0 <= betas[0] < 1.0:
-            raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
-        if not 0.0 <= betas[1] < 1.0:
-            raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
-        if not 0.0 <= weight_decay:
-            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
-
-        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
-        super().__init__(params, defaults)
+        param_groups,
+        lr_rmnp=0.005,       # Nora 算法使用的学习率
+        lr_adam=0.001,       # AdamW 分支使用的学习率
+        beta=0.95,           # Nora 的动量系数
+        weight_decay=0.0,    # 权重衰减
+        betas=(0.9, 0.95),   # AdamW 分支使用的 betas
+        eps=1e-10,           # 数值稳定性常数
+    ):
+        defaults = dict(
+            lr_rmnp=lr_rmnp,
+            lr_adam=lr_adam,
+            beta=beta,
+            weight_decay=weight_decay,
+            betas=betas,
+            eps=eps,
+        )
+        super().__init__(param_groups, defaults)
 
     @torch.no_grad()
     def step(self, closure=None):
-        """Performs a single optimization step.
-
-        Args:
-            closure (callable, optional): A closure that reevaluates the model
-                and returns the loss.
-        """
+        """执行单一的优化步骤"""
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -66,89 +41,134 @@ class Nora(Optimizer):
 
         for group in self.param_groups:
             lr = group["lr"]
-            beta1, beta2 = group["betas"]
-            eps = group["eps"]
-            weight_decay = group["weight_decay"]
+            beta = group.get("beta", 0.95)
+            weight_decay = group.get("weight_decay", 0.0)
+            betas = group.get("betas", (0.9, 0.95))
+            eps = group.get("eps", 1e-10)
+            
+            # 标志位决定该参数组是否使用 Nora 核心算法
+            is_rmnp = group.get("is_rmnp", True)
 
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                
-                if torch.is_complex(p):
-                    raise RuntimeError("Nora does not support complex parameters")
-                if p.grad.is_sparse:
-                    raise RuntimeError("Nora does not support sparse gradients")
 
                 grad = p.grad
-                state = self.state[p]
+                param_state = self.state.setdefault(p, {})
 
-                # State initialization
-                if len(state) == 0:
-                    state["step"] = 0
-                    if p.ndim == 2:
-                        # Nora state: only requires a momentum buffer
-                        state["momentum_buffer"] = torch.zeros_like(
-                            p, memory_format=torch.preserve_format
+                # =========================================================
+                # NORA 算法分支 (应用于 2D 参数)
+                # =========================================================
+                if is_rmnp and grad.dim() >= 2:
+                    # 初始化动量 buffer
+                    if "momentum_buffer" not in param_state:
+                        param_state["momentum_buffer"] = torch.zeros_like(
+                            grad, memory_format=torch.preserve_format
                         )
-                    else:
-                        # AdamW state: requires exp_avg and exp_avg_sq
-                        state["exp_avg"] = torch.zeros_like(
-                            p, memory_format=torch.preserve_format
-                        )
-                        state["exp_avg_sq"] = torch.zeros_like(
-                            p, memory_format=torch.preserve_format
-                        )
+                    buf = param_state["momentum_buffer"]
 
-                state["step"] += 1
+                    # 1. 计算动量 (EMA): m_t = beta * m_{t-1} + (1 - beta) * g_t
+                    buf.lerp_(grad, 1 - beta)
 
-                if p.ndim == 2:
-                    # =========================================================
-                    # NORA ALGORITHM (For 2D Matrix Parameters)
-                    # =========================================================
-                    buf = state["momentum_buffer"]
-                    
-                    # 1. Update momentum: m_t = \beta * m_{t-1} + (1 - \beta) * g_t
-                    buf.mul_(beta1).add_(grad, alpha=1.0 - beta1)
-                    
-                    # 2. Row-wise tangent projection: m^{r\perp}
-                    # P_{i:} = m_{i:} - (<m_{i:}, w_{i:}> / ||w_{i:}||_2^2) * w_{i:}
-                    dot_prod = torch.sum(buf * p, dim=1, keepdim=True)
-                    w_norm_sq = torch.sum(p * p, dim=1, keepdim=True)
-                    m_proj = buf - (dot_prod / w_norm_sq.clamp(min=eps)) * p
-                    
-                    # 3. Row-wise normalization: d_t = m^{r\perp} / ||m^{r\perp}||_2
-                    m_proj_norm = torch.linalg.vector_norm(m_proj, dim=1, keepdim=True)
-                    d_t = m_proj / m_proj_norm.clamp(min=eps)
-                    
-                    # 4. Decoupled weight decay and parameter update
-                    # w_{t+1} = w_t - \eta_t * (d_t + \lambda * w_t)
-                    if weight_decay > 0.0:
-                        p.mul_(1.0 - lr * weight_decay)
-                        
-                    p.add_(d_t, alpha=-lr)
-                    
+                    # 2. 行空间切线投影 (Row-wise Tangent Projection)
+                    # 提前将权重按行做 L2 归一化，既避免除零风险，又让公式计算更简洁
+                    theta_hat = F.normalize(p, p=2, dim=-1, eps=eps)
+                    dot_product = torch.sum(buf * theta_hat, dim=-1, keepdim=True)
+                    v = buf - dot_product * theta_hat # 等价于论文的 m_t^{r\perp}
+
+                    # 3. 行归一化 (Row-wise Normalization)
+                    v_hat = F.normalize(v, p=2, dim=-1, eps=eps) # d_t
+
+                    # 4. 学习率缩放适配 (匹配 Muon 的 RMS 缩放尺度)
+                    scale = max(1.0, math.sqrt(grad.size(-2) / grad.size(-1)))
+                    update_direction = v_hat * scale
+
+                    # 5. 解耦权重衰减与参数更新
+                    if weight_decay > 0:
+                        p.mul_(1 - lr * weight_decay)
+
+                    p.add_(update_direction, alpha=-lr)
+
+                # =========================================================
+                # AdamW 算法分支 (应用于 1D 偏置、LayerNorm 等)
+                # =========================================================
                 else:
-                    # =========================================================
-                    # ADAMW ALGORITHM (For 1D / >2D Parameters)
-                    # =========================================================
-                    exp_avg = state["exp_avg"]
-                    exp_avg_sq = state["exp_avg_sq"]
-                    step = state["step"]
+                    if "exp_avg" not in param_state:
+                        param_state["exp_avg"] = torch.zeros_like(
+                            grad, memory_format=torch.preserve_format
+                        )
+                        param_state["exp_avg_sq"] = torch.zeros_like(
+                            grad, memory_format=torch.preserve_format
+                        )
+                        param_state["step"] = 0
 
-                    # Decay the first and second moment running average coefficient
-                    exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
-                    exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+                    exp_avg = param_state["exp_avg"]
+                    exp_avg_sq = param_state["exp_avg_sq"]
+                    param_state["step"] += 1
 
-                    bias_correction1 = 1.0 - beta1 ** step
-                    bias_correction2 = 1.0 - beta2 ** step
-                    step_size = lr / bias_correction1
+                    # 动量与二阶矩更新
+                    exp_avg.mul_(betas[0]).add_(grad, alpha=1 - betas[0])
+                    exp_avg_sq.mul_(betas[1]).addcmul_(grad, grad, value=1 - betas[1])
 
-                    denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)
+                    # 偏差校正
+                    bias_correction1 = 1 - betas[0] ** param_state["step"]
+                    bias_correction2 = 1 - betas[1] ** param_state["step"]
+                    
+                    step_size = lr * math.sqrt(bias_correction2) / bias_correction1
+                    denom = exp_avg_sq.sqrt().add_(eps)
+                    adam_update = exp_avg / denom
 
-                    # Decoupled weight decay
-                    if weight_decay > 0.0:
-                        p.mul_(1.0 - lr * weight_decay)
+                    # 解耦权重衰减与参数更新
+                    if weight_decay > 0:
+                        p.mul_(1 - step_size * weight_decay)
 
-                    p.addcdiv_(exp_avg, denom, value=-step_size)
+                    p.add_(adam_update, alpha=-step_size)
 
         return loss
+
+
+def get_nora_optimizer(
+    model,
+    lr_rmnp=0.005,
+    lr_adam=0.001,
+    weight_decay=0.1,
+    beta=0.95,
+):
+    """
+    自动化构建 Nora 优化器的辅助函数。
+    """
+    rmnp_params = []
+    adam_params = []
+
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            # 区分矩阵权重(Nora)和向量权重(AdamW)
+            if param.ndim >= 2 and "embed" not in name and "lm_head" not in name:
+                rmnp_params.append(param)
+            else:
+                adam_params.append(param)
+
+    param_groups = [
+        # Nora 分组
+        dict(
+            params=rmnp_params,
+            lr=lr_rmnp,              
+            lr_rmnp=lr_rmnp,         
+            lr_adam=lr_adam,         
+            weight_decay=weight_decay,
+            beta=beta,
+            is_rmnp=True,            
+        ),
+        # AdamW 分组
+        dict(
+            params=adam_params,
+            lr=lr_adam,              
+            lr_rmnp=lr_rmnp,
+            lr_adam=lr_adam,
+            weight_decay=weight_decay,
+            beta=beta,
+            is_rmnp=False,           
+        ),
+    ]
+    
+    return NORA(param_groups)
