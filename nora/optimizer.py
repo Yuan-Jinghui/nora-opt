@@ -1,175 +1,154 @@
+# mypy: allow-untyped-defs
+# mypy: disable-error-code=arg-type
+"""Implementation of the Nora optimizer with automatic AdamW fallback for 1D params."""
+
 import math
 import torch
-import torch.nn.functional as F
+from torch import Tensor
+from torch.optim.optimizer import Optimizer
 
-LOW_PRECISION_DTYPES = (torch.float16, torch.bfloat16)
+__all__ = ["Nora"]
 
-class Nora(torch.optim.Optimizer):
-    """Normalized Orthogonal Row Alignment optimizer for scalable matrix training."""
+class Nora(Optimizer):
+    r"""Implements the Nora (Normalized Orthogonal Row Alignment) algorithm.
+    
+    Automatically applies Nora to 2D parameters (e.g., linear layers) and falls back 
+    to AdamW for 1D or >2D parameters (e.g., biases, normalization layers, embeddings).
 
+    Nora updates 2D parameters by explicitly projecting the momentum onto the tangent 
+    space of the weights and performing a row-wise normalization.
+    
+    Args:
+        params (iterable): iterable of parameters to optimize or dicts defining parameter groups
+        lr (float, optional): learning rate (default: 1e-3)
+        betas (Tuple[float, float], optional): coefficients used for computing
+            running averages of gradient and its square. beta1 acts as the momentum 
+            coefficient \beta for Nora. (default: (0.9, 0.999))
+        eps (float, optional): term added to the denominator to improve
+            numerical stability (default: 1e-8)
+        weight_decay (float, optional): decoupled weight decay (L2 penalty) (default: 0.0)
+    """
+    
     def __init__(
         self,
-        param_groups,
-        lr_nora: float = 0.005,
-        lr_adam: float = 0.001,
-        momentum: float = 0.95,
-        beta: float = 0.95,
-        weight_decay: float = 0.0, 
-        betas: tuple[float, float] = (0.9, 0.95),
-        eps: float = 1e-10,
-    ):
-        defaults = dict(
-            lr_nora=lr_nora,
-            lr_adam=lr_adam,
-            momentum=momentum,
-            beta=beta,
-            weight_decay=weight_decay,
-            betas=betas,
-            eps=eps,
-        )
-        super().__init__(param_groups, defaults)
+        params,
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.0,
+    ) -> None:
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= eps:
+            raise ValueError(f"Invalid epsilon value: {eps}")
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
+        if not 0.0 <= weight_decay:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
 
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
     def step(self, closure=None):
+        """Performs a single optimization step.
+
+        Args:
+            closure (callable, optional): A closure that reevaluates the model
+                and returns the loss.
+        """
         loss = None
         if closure is not None:
-            loss = closure()
+            with torch.enable_grad():
+                loss = closure()
 
         for group in self.param_groups:
             lr = group["lr"]
-            momentum = group.get("momentum", 0.95)
-            beta = group.get("beta", 0.95)
-            weight_decay = group.get("weight_decay", 0.0)
-            betas = group.get("betas", (0.9, 0.95))
-            eps = group.get("eps", 1e-10)
-            is_nora = group.get("is_nora", True)
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+            weight_decay = group["weight_decay"]
 
             for p in group["params"]:
                 if p.grad is None:
                     continue
+                
+                if torch.is_complex(p):
+                    raise RuntimeError("Nora does not support complex parameters")
+                if p.grad.is_sparse:
+                    raise RuntimeError("Nora does not support sparse gradients")
 
-                grad = p.grad.data
-                param_state = self.state.setdefault(p, {})
+                grad = p.grad
+                state = self.state[p]
 
-                use_master_param = p.data.dtype in LOW_PRECISION_DTYPES
-                if use_master_param:
-                    if "fp32_param" not in param_state:
-                        param_state["fp32_param"] = p.data.detach().float().clone()
-                    elif param_state["fp32_param"].dtype != torch.float32:
-                        param_state["fp32_param"] = param_state["fp32_param"].float()
-                    param_data = param_state["fp32_param"]
-                    grad_data = grad.float()
-                else:
-                    param_data = p.data
-                    grad_data = grad
-
-                if is_nora and grad.dim() >= 2:
-                    if "momentum_buffer" not in param_state:
-                        buf = torch.zeros_like(grad_data)
+                # State initialization
+                if len(state) == 0:
+                    state["step"] = 0
+                    if p.ndim == 2:
+                        # Nora state: only requires a momentum buffer
+                        state["momentum_buffer"] = torch.zeros_like(
+                            p, memory_format=torch.preserve_format
+                        )
                     else:
-                        buf = param_state["momentum_buffer"]
-                        if use_master_param and buf.dtype != torch.float32:
-                            buf = buf.float()
+                        # AdamW state: requires exp_avg and exp_avg_sq
+                        state["exp_avg"] = torch.zeros_like(
+                            p, memory_format=torch.preserve_format
+                        )
+                        state["exp_avg_sq"] = torch.zeros_like(
+                            p, memory_format=torch.preserve_format
+                        )
 
+                state["step"] += 1
 
-                    buf.lerp_(grad_data, 1 - beta)
-                    m_t = grad_data.lerp(buf, momentum)
-
-
-                    theta_hat = F.normalize(param_data, p=2, dim=-1, eps=eps)
-
-
-                    dot_product = torch.sum(m_t * theta_hat, dim=-1, keepdim=True)
-                    v = m_t - dot_product * theta_hat
-
-
-                    v_hat = F.normalize(v, p=2, dim=-1, eps=eps)
-
-                    scale = max(1, math.sqrt(grad_data.size(-2) / grad_data.size(-1)))
-                    update_direction = v_hat * scale
-
-                    if weight_decay > 0:
-                        param_data.mul_(1 - lr * weight_decay)
-
-                    param_data.add_(update_direction, alpha=-lr)
-
-                    if use_master_param:
-                        p.data.copy_(param_data.to(dtype=p.data.dtype))
-
-                    param_state["momentum_buffer"] = buf
-
-
+                if p.ndim == 2:
+                    # =========================================================
+                    # NORA ALGORITHM (For 2D Matrix Parameters)
+                    # =========================================================
+                    buf = state["momentum_buffer"]
+                    
+                    # 1. Update momentum: m_t = \beta * m_{t-1} + (1 - \beta) * g_t
+                    buf.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+                    
+                    # 2. Row-wise tangent projection: m^{r\perp}
+                    # P_{i:} = m_{i:} - (<m_{i:}, w_{i:}> / ||w_{i:}||_2^2) * w_{i:}
+                    dot_prod = torch.sum(buf * p, dim=1, keepdim=True)
+                    w_norm_sq = torch.sum(p * p, dim=1, keepdim=True)
+                    m_proj = buf - (dot_prod / w_norm_sq.clamp(min=eps)) * p
+                    
+                    # 3. Row-wise normalization: d_t = m^{r\perp} / ||m^{r\perp}||_2
+                    m_proj_norm = torch.linalg.vector_norm(m_proj, dim=1, keepdim=True)
+                    d_t = m_proj / m_proj_norm.clamp(min=eps)
+                    
+                    # 4. Decoupled weight decay and parameter update
+                    # w_{t+1} = w_t - \eta_t * (d_t + \lambda * w_t)
+                    if weight_decay > 0.0:
+                        p.mul_(1.0 - lr * weight_decay)
+                        
+                    p.add_(d_t, alpha=-lr)
+                    
                 else:
-                    if "exp_avg" not in param_state:
-                        param_state["exp_avg"] = torch.zeros_like(grad_data)
-                        param_state["exp_avg_sq"] = torch.zeros_like(grad_data)
-                        param_state["step"] = 0
-                    elif use_master_param and param_state["exp_avg"].dtype != torch.float32:
-                        param_state["exp_avg"] = param_state["exp_avg"].float()
-                        param_state["exp_avg_sq"] = param_state["exp_avg_sq"].float()
+                    # =========================================================
+                    # ADAMW ALGORITHM (For 1D / >2D Parameters)
+                    # =========================================================
+                    exp_avg = state["exp_avg"]
+                    exp_avg_sq = state["exp_avg_sq"]
+                    step = state["step"]
 
-                    exp_avg, exp_avg_sq = param_state["exp_avg"], param_state["exp_avg_sq"]
-                    param_state["step"] += 1
+                    # Decay the first and second moment running average coefficient
+                    exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+                    exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
 
-                    exp_avg.mul_(betas[0]).add_(grad_data, alpha=1 - betas[0])
-                    exp_avg_sq.mul_(betas[1]).addcmul_(grad_data, grad_data, value=1 - betas[1])
+                    bias_correction1 = 1.0 - beta1 ** step
+                    bias_correction2 = 1.0 - beta2 ** step
+                    step_size = lr / bias_correction1
 
-                    bias_correction1 = 1 - betas[0] ** param_state["step"]
-                    bias_correction2 = 1 - betas[1] ** param_state["step"]
-                    step_size = lr * math.sqrt(bias_correction2) / bias_correction1
+                    denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)
 
-                    denom = exp_avg_sq.sqrt().add_(eps)
-                    adam_update = exp_avg / denom
+                    # Decoupled weight decay
+                    if weight_decay > 0.0:
+                        p.mul_(1.0 - lr * weight_decay)
 
-                    if weight_decay > 0:
-                        param_data.mul_(1 - step_size * weight_decay)
-
-                    param_data.add_(adam_update, alpha=-step_size)
-
-                    if use_master_param:
-                        p.data.copy_(param_data.to(dtype=p.data.dtype))
+                    p.addcdiv_(exp_avg, denom, value=-step_size)
 
         return loss
-
-
-def get_nora_optimizer(
-    model,
-    lr_nora: float = 0.005,
-    lr_adam: float = 0.001,
-    weight_decay: float = 0.0, 
-    momentum: float = 0.95,
-    beta: float = 0.95,
-):
-    nora_params = []
-    adam_params = []
-
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            if param.ndim >= 2 and "embed" not in name and "lm_head" not in name:
-                nora_params.append(param)
-            else:
-                adam_params.append(param)
-
-    param_groups = [
-        dict(
-            params=nora_params,
-            lr=lr_nora,
-            lr_nora=lr_nora,
-            lr_adam=lr_adam,
-            weight_decay=weight_decay,
-            momentum=momentum,
-            beta=beta,
-            is_nora=True,
-        ),
-        dict(
-            params=adam_params,
-            lr=lr_adam,
-            lr_nora=lr_nora,
-            lr_adam=lr_adam,
-            weight_decay=weight_decay,
-            momentum=momentum,
-            beta=beta,
-            is_nora=False,
-        ),
-    ]
-    optimizer = Nora(param_groups)
-    return optimizer
