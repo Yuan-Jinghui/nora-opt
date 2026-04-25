@@ -2,7 +2,7 @@ import math
 import torch
 import torch.nn.functional as F
 
-class NORA(torch.optim.Optimizer):
+class Nora(torch.optim.Optimizer):
     """
     Normalized Orthogonal Row Alignment (NORA) 优化器。
     
@@ -171,4 +171,4 @@ def get_nora_optimizer(
         ),
     ]
     
-    return NORA(param_groups)
+    return Nora(param_groups)
